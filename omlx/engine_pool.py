@@ -469,16 +469,25 @@ class EnginePool:
         entry.last_access = 0.0
         entry.actual_size = None
 
-        # Force garbage collection to release memory.
-        # Run mx.clear_cache on the global MLX executor to avoid concurrent
-        # Metal operations with running engines. See issue #85.
-        # Synchronize before clearing to prevent releasing Metal buffers
-        # still referenced by in-flight command buffers. See issue #300.
-        gc.collect()
+        # Reclaim memory on the global MLX executor thread (the only thread that
+        # should issue MLX ops; see get_mlx_executor) and synchronize BEFORE any
+        # buffer is released. gc.collect() finalizes the last cyclic objects that
+        # still hold mx.arrays (e.g. DeepSeek V4's HyperConnection graph) and so
+        # releases Metal buffers -- running it on the bare main thread *before*
+        # the synchronize (the previous order, which contradicted the comment
+        # below) freed buffers that in-flight GPU command buffers still
+        # referenced: a use-after-free that crashed the process with SIGSEGV on
+        # unload. Correct order, all on the MLX thread: drain GPU -> gc -> drain
+        # -> clear pool. See issues #85 / #300 / #888 / #1106.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+
+        def _reclaim() -> None:
+            mx.synchronize()
+            gc.collect()
+            mx.synchronize()
+            mx.clear_cache()
+
+        await loop.run_in_executor(get_mlx_executor(), _reclaim)
 
         # Memory settle barrier: poll actual freed memory instead of
         # trusting the cumulative _current_model_memory estimate.
