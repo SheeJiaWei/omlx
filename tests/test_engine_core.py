@@ -22,6 +22,46 @@ from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import SchedulerConfig
 
 
+class TestEngineCoreTeardownSync:
+    """Regression tests for the unload GPU-stream drain (DeepSeek V4 SIGSEGV)."""
+
+    def test_close_drains_engine_stream_before_releasing_model(
+        self, mock_model, mock_tokenizer
+    ):
+        """close() must synchronize the engine's GPU stream before dropping the
+        model reference.
+
+        DeepSeek V4's HyperConnection enqueues a custom ``mx.fast.metal_kernel``
+        that takes weight buffers as GPU inputs; those command buffers must
+        retire before the weights are freed. Without the drain, unload is a
+        use-after-free that crashes the whole process with SIGSEGV. This guards
+        the teardown ordering so the drain runs (on the engine's own stream)
+        while the model is still alive.
+        """
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine_stream = engine._mlx_stream
+
+            calls = []
+
+            def _record(stream=None):
+                # Capture that the model ref is still alive at drain time.
+                calls.append((stream, engine.model is not None))
+
+            with patch(
+                "omlx.engine_core._sync_and_clear_cache", side_effect=_record
+            ):
+                engine.close()
+
+            assert (engine_stream, True) in calls, (
+                "close() must drain the engine GPU stream (on its own stream, "
+                f"while the model is still held) before releasing it; calls={calls}"
+            )
+            assert engine.model is None
+
+
 class TestEngineConfig:
     """Tests for EngineConfig dataclass."""
 

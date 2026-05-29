@@ -23,7 +23,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 import mlx.core as mx
 
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
+from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput, _sync_and_clear_cache
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry, ModelOwnershipError
 
@@ -716,6 +716,26 @@ class EngineCore:
                     fn()
                 except RuntimeError:
                     pass
+
+        # Drain the engine's GPU stream before any weight buffer is freed.
+        # DeepSeek V4's HyperConnection enqueues a custom mx.fast.metal_kernel
+        # that takes model-weight buffers (scale/base) as direct GPU inputs;
+        # those command buffers must retire while the weights are still alive.
+        # BatchedEngine.stop() drops the model's last reference on the main
+        # thread (off this executor) right after close() returns, with no
+        # further barrier -- so without this drain that free is a use-after-free
+        # of in-flight buffers and the process dies with SIGSEGV on unload.
+        # Standard models use only built-in MLX ops that retire immediately, so
+        # they never expose the gap. See _sync_and_clear_cache (issues
+        # #300 / #888 / #1106).
+        if self._mlx_executor is not None:
+            logger.info("Engine %s: draining GPU stream before unload", self._engine_id)
+            try:
+                self._mlx_executor.submit(
+                    lambda: _sync_and_clear_cache(self._mlx_stream)
+                ).result()
+            except RuntimeError:
+                pass
 
         if self._mlx_executor is not None:
             self._mlx_executor.shutdown(wait=True)
