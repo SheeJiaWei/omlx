@@ -13,6 +13,7 @@ Note: Uses pytest-asyncio for async tests.
 """
 
 import asyncio
+import threading
 from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
@@ -25,18 +26,20 @@ from omlx.scheduler import SchedulerConfig
 class TestEngineCoreTeardownSync:
     """Regression tests for the unload GPU-stream drain (DeepSeek V4 SIGSEGV)."""
 
-    def test_close_drains_engine_stream_before_releasing_model(
+    def test_close_releases_model_and_drains_on_engine_thread(
         self, mock_model, mock_tokenizer
     ):
-        """close() must synchronize the engine's GPU stream before dropping the
-        model reference.
+        """close() must release the model and drain+clear the Metal cache ON the
+        per-engine executor thread (which owns ``_mlx_stream``), before that
+        executor is shut down.
 
-        DeepSeek V4's HyperConnection enqueues a custom ``mx.fast.metal_kernel``
-        that takes weight buffers as GPU inputs; those command buffers must
-        retire before the weights are freed. Without the drain, unload is a
-        use-after-free that crashes the whole process with SIGSEGV. This guards
-        the teardown ordering so the drain runs (on the engine's own stream)
-        while the model is still alive.
+        DeepSeek V4's HyperConnection runs a custom ``mx.fast.metal_kernel``; its
+        buffers (and the weights it reads) must be freed and the cache cleared on
+        the stream's owning thread, after a sync. Doing it on another thread
+        after the executor is gone (the original crash) is a use-after-free ->
+        SIGSEGV on unload. This guards that the teardown drain targets the
+        per-engine stream, runs on the ``mlx-engine-*`` thread, and that the
+        model reference is already released at that point.
         """
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
@@ -47,17 +50,31 @@ class TestEngineCoreTeardownSync:
             calls = []
 
             def _record(stream=None):
-                # Capture that the model ref is still alive at drain time.
-                calls.append((stream, engine.model is not None))
+                calls.append(
+                    {
+                        "stream": stream,
+                        "thread": threading.current_thread().name,
+                        "model_released": engine.model is None,
+                    }
+                )
 
             with patch(
                 "omlx.engine_core._sync_and_clear_cache", side_effect=_record
             ):
                 engine.close()
 
-            assert (engine_stream, True) in calls, (
-                "close() must drain the engine GPU stream (on its own stream, "
-                f"while the model is still held) before releasing it; calls={calls}"
+            assert len(calls) == 1, f"expected exactly one teardown drain; got {calls}"
+            call = calls[0]
+            assert call["stream"] is engine_stream, (
+                "teardown must drain the per-engine stream, not the default one"
+            )
+            assert call["thread"].startswith("mlx-engine-"), (
+                "teardown must run on the per-engine executor thread (owns the "
+                f"GPU stream), but ran on {call['thread']!r}"
+            )
+            assert call["model_released"] is True, (
+                "model must be released on the executor thread before the cache "
+                "is cleared (so freed buffers are reclaimed on the owning thread)"
             )
             assert engine.model is None
 

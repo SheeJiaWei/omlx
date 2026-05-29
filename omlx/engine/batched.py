@@ -351,6 +351,14 @@ class BatchedEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         if self._engine:
             await self._engine.stop()
+            # Drop our own model/tokenizer refs BEFORE closing the EngineCore so
+            # that EngineCore.close() holds the last strong references and can
+            # free the model + clear the Metal cache on its own executor thread
+            # (which owns the GPU stream) before that thread is torn down. This
+            # avoids a use-after-free SIGSEGV when unloading DeepSeek V4, whose
+            # HyperConnection runs a custom Metal kernel. See EngineCore.close().
+            self._model = None
+            self._tokenizer = None
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
                 try:
                     self._engine.engine.close()

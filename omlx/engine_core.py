@@ -14,6 +14,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import concurrent.futures
+import gc
 import logging
 import time
 import uuid
@@ -717,25 +718,41 @@ class EngineCore:
                 except RuntimeError:
                     pass
 
-        # Drain the engine's GPU stream before any weight buffer is freed.
+        # Release the model and run the GPU teardown ON the per-engine executor
+        # thread, while it still owns ``_mlx_stream``, BEFORE shutting it down.
+        #
         # DeepSeek V4's HyperConnection enqueues a custom mx.fast.metal_kernel
-        # that takes model-weight buffers (scale/base) as direct GPU inputs;
-        # those command buffers must retire while the weights are still alive.
-        # BatchedEngine.stop() drops the model's last reference on the main
-        # thread (off this executor) right after close() returns, with no
-        # further barrier -- so without this drain that free is a use-after-free
-        # of in-flight buffers and the process dies with SIGSEGV on unload.
-        # Standard models use only built-in MLX ops that retire immediately, so
-        # they never expose the gap. See _sync_and_clear_cache (issues
-        # #300 / #888 / #1106).
+        # whose buffers (and the model weights it reads) must be freed and the
+        # Metal cache cleared on the stream's owning thread, after a sync. The
+        # caller (BatchedEngine.stop) has already dropped its model/tokenizer
+        # refs, so nulling them here drops the last strong references;
+        # gc.collect() then breaks the nn.Module reference cycles and
+        # _sync_and_clear_cache() drains the stream and reclaims the buffers --
+        # all on this thread. Freeing or clearing on another thread after the
+        # executor is gone (e.g. the EnginePool settle barrier) is a
+        # use-after-free that crashes the process with SIGSEGV on unload; only
+        # DeepSeek V4 exposes it, because stock models use built-in ops that
+        # retire immediately. See _sync_and_clear_cache (issues #300/#888/#1106).
+        def _final_teardown() -> None:
+            self.model = None
+            self.tokenizer = None
+            self.scheduler = None
+            gc.collect()
+            _sync_and_clear_cache(self._mlx_stream)
+
         if self._mlx_executor is not None:
-            logger.info("Engine %s: draining GPU stream before unload", self._engine_id)
+            logger.info(
+                "Engine %s: releasing model + draining GPU stream before unload",
+                self._engine_id,
+            )
             try:
-                self._mlx_executor.submit(
-                    lambda: _sync_and_clear_cache(self._mlx_stream)
-                ).result()
+                self._mlx_executor.submit(_final_teardown).result()
             except RuntimeError:
-                pass
+                # Executor already gone -- best-effort inline release so we do
+                # not leak the model (loses the on-owning-thread guarantee).
+                _final_teardown()
+        else:
+            _final_teardown()
 
         if self._mlx_executor is not None:
             self._mlx_executor.shutdown(wait=True)
@@ -747,11 +764,6 @@ class EngineCore:
         self._output_collectors.clear()
         self._stream_states.clear()
         self._finished_events.clear()
-
-        # Release model and tokenizer references for GC
-        self.model = None
-        self.tokenizer = None
-        self.scheduler = None
 
         logger.debug(f"Engine {self._engine_id} closed")
 
