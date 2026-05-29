@@ -1,9 +1,17 @@
 # Copyright © 2026 Apple Inc.
 
+import os
 from typing import Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+
+# oMLX debug escape-hatch (NOT in upstream PR 1192): when OMLX_HC_DISABLE_KERNEL
+# is set, force the pure-MLX HyperConnection path (_hc_ops) instead of the custom
+# Metal kernel (_hc_kernel). Used to test / work around a suspected buffer-
+# ownership double-free in the custom kernel that crashes the process with
+# SIGSEGV when unloading DeepSeek V4.
+_HC_FORCE_OPS = os.environ.get("OMLX_HC_DISABLE_KERNEL", "") not in ("", "0", "false", "False")
 
 
 def _make_hc_sinkhorn_collapse_kernel():
@@ -236,7 +244,8 @@ class HyperConnection(nn.Module):
         mixes = z @ self.fn.T
 
         use_ops = (
-            self.training
+            _HC_FORCE_OPS
+            or self.training
             or mx.default_device() != mx.gpu
             or not mx.metal.is_available()
         )
