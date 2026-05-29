@@ -6160,6 +6160,15 @@ class Scheduler:
         self.paged_cache_manager = None
         self.block_aware_cache = None
         self.memory_monitor = None
+        # Defense in depth: deep_reset() may be called without a preceding
+        # shutdown() (error recovery). Join the writer daemon before dropping
+        # the store so it cannot release cache-tensor aliases off-thread after
+        # the buffers are freed (see shutdown() for the full rationale).
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.shutdown()
+            except Exception:
+                pass
         self._boundary_snapshot_store = None
 
         # Force garbage collection of any lingering cache objects
@@ -6209,6 +6218,21 @@ class Scheduler:
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
+        # Join the boundary-snapshot-writer daemon thread BEFORE the engine
+        # frees model/cache buffers (shutdown() runs ahead of deep_reset() in
+        # EngineCore.close). That writer's finally block drops the snapshot's
+        # retained cache-tensor references; if it runs on its own thread after
+        # the buffers are freed it double-frees Metal memory -> asynchronous
+        # SIGSEGV on DeepSeek V4 unload. shutdown() join()s (5s bound) so no
+        # off-thread release can race the free; clearing _pending_writes then
+        # drops any residual references here, on this executor thread.
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.shutdown()
+                with self._boundary_snapshot_store._pending_lock:
+                    self._boundary_snapshot_store._pending_writes.clear()
+            except Exception as e:
+                logger.warning("Boundary snapshot store shutdown error: %s", e)
         logger.info("Scheduler shutdown completed")
 
     def adjust_store_cache_cap(self, pressure_level: str) -> None:

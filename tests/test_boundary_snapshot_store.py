@@ -78,6 +78,41 @@ class TestBoundarySnapshotSSDStore:
         yield
         self.store.shutdown()
 
+    def test_save_does_not_retain_live_extracted_aliases(self):
+        """Regression: save() must NOT keep the live ``extracted`` mx.arrays.
+
+        Those are un-copied slice views aliasing live cache buffers; retaining
+        them let the writer daemon drop the last alias off-thread after unload
+        freed the same buffers -> Metal double-free / async SIGSEGV unloading
+        DeepSeek V4. We stop the writer first so the pending entry is
+        observable (the writer would otherwise pop it after the disk write).
+        """
+        self.store.shutdown()  # freeze the writer so _pending_writes is stable
+        ok = self.store.save(
+            "req-alias", 2048, [MagicMock()], _mock_extract_cache_states
+        )
+        assert ok
+        pending = self.store._pending_writes[("req-alias", 2048)]
+        assert pending["extracted"] is None, (
+            "save() must not retain live cache-buffer aliases in _pending_writes"
+        )
+        # Read-back must still work, reconstructed from independent CPU bytes.
+        loaded = self.store.load("req-alias", 2048)
+        assert loaded is not None and len(loaded) == 4
+
+    def test_shutdown_joins_writer_thread(self):
+        """Regression: shutdown() must join the background writer daemon.
+
+        If the daemon outlives teardown it can release cache-tensor references
+        on its own thread after the engine freed the buffers (the unload
+        SIGSEGV). scheduler.shutdown()/deep_reset() now call this.
+        """
+        assert self.store._writer_thread.is_alive()
+        self.store.shutdown()
+        assert not self.store._writer_thread.is_alive(), (
+            "shutdown() must join the boundary-snapshot writer thread"
+        )
+
     def test_save_and_load_roundtrip(self):
         """Save a snapshot and load it back — tensors should match."""
         ok = self.store.save(

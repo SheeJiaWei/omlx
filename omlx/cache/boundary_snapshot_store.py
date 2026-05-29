@@ -163,7 +163,18 @@ class BoundarySnapshotSSDStore:
                 self._pending_writes[pw_key] = {
                     "tensors_raw": tensors_raw,
                     "metadata": metadata,
-                    "extracted": extracted,  # keep for cheap read-back
+                    # Do NOT retain the live ``extracted`` mx.arrays. Their
+                    # PoolingCache/RotatingKVCache ``.state`` members are
+                    # un-copied slice VIEWS aliasing live cache buffers
+                    # (cache_extras.py:131-135). Keeping them here let the
+                    # background writer thread drop the last alias from its
+                    # ``finally`` (pop("extracted")) on its OWN thread, after
+                    # engine unload had already freed the same Metal buffers on
+                    # the executor thread -> cross-thread double-free, surfacing
+                    # as an async Metal-completion-handler SIGSEGV when
+                    # unloading DeepSeek V4. ``load()`` falls back to
+                    # ``tensors_raw`` (an independent CPU-byte copy).
+                    "extracted": None,
                 }
 
             # 4. Compute file path and register.
